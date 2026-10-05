@@ -33,4 +33,5 @@ H3K9me3 CHIPseq was performed on patient-derived GSCs following HDAC7 siRNA knoc
 - Epigebetic mark: H3K9me3
 - Assay: Bulk RNA-seq
 - Objective: Characterize HDAC7-dependent changes in repressive chromatin
+- Approach: Peak calling using MACS and SICER for mapping enrichment H3K9me3 regions relative to input and CTRL 
 
