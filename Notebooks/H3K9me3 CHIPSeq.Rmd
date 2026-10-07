@@ -1,0 +1,1854 @@
+---
+title: "HDAC7_H3K9me3, exploratory H3K9me3 ChIP-seq Analysis Following HDAC7 Knockdown in Glioblastoma Stem Cells"
+author: "Ola Hassan"
+date: "10/5/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+# Import the BED tables
+
+```{r }
+control <- read.delim(
+  "data_raw/GSM8720290_gb2_sicontrol_h3k9me3.bed",
+  header = FALSE,
+  col.names = c("chromosome", "start", "end", "field4"),
+  stringsAsFactors = FALSE
+)
+
+knockdown <- read.delim(
+  "data_raw/GSM8720291_gb2_sihdac7_h3k9me3.bed",
+  header = FALSE,
+  col.names = c("chromosome", "start", "end", "field4"),
+  stringsAsFactors = FALSE
+)
+
+head(control)
+head(knockdown)
+
+str(control)
+str(knockdown)
+
+```
+
+# Check the number of regions and coordinate validity
+
+```{r }
+c(
+  control_regions = nrow(control),
+  knockdown_regions = nrow(knockdown)
+)
+
+stopifnot(
+  !anyNA(control),
+  !anyNA(knockdown),
+  all(control$start >= 0),
+  all(knockdown$start >= 0),
+  all(control$end > control$start),
+  all(knockdown$end > knockdown$start)
+)
+```
+
+
+# Examine the interval lengths
+
+```{r }
+
+# Coordinate spans as stored in these files
+control$coordinate_span <- control$end - control$start
+knockdown$coordinate_span <- knockdown$end - knockdown$start
+
+summary(control$coordinate_span)
+summary(knockdown$coordinate_span)
+
+par(mfrow = c(1, 2))
+
+hist(
+  log10(control$coordinate_span),
+  breaks = 50,
+  main = "Control",
+  xlab = "log10 coordinate span (bp)",
+  col = "steelblue",
+  border = "white"
+)
+
+hist(
+  log10(knockdown$coordinate_span),
+  breaks = 50,
+  main = "HDAC7 knockdown",
+  xlab = "log10 coordinate span (bp)",
+  col = "tomato",
+  border = "white"
+)
+
+par(mfrow = c(1, 1))
+
+# something to get back to later that the siCT sample contains more called intervals relative to siHDAC7
+```
+
+
+# examine the distribution with a boxplot and check for duplicated coordinates:
+
+```{r }
+# Compare the distributions on a log scale
+boxplot(
+  list(
+    Control = log10(control$coordinate_span),
+    HDAC7_KD = log10(knockdown$coordinate_span)
+  ),
+  ylab = "log10 coordinate span (bp)",
+  main = "H3K9me3 interval spans",
+  col = c("steelblue", "tomato"),
+  outline = FALSE
+)
+
+# Check for repeated genomic coordinates
+c(
+  control_duplicates = sum(
+    duplicated(control[c("chromosome", "start", "end")])
+  ),
+  knockdown_duplicates = sum(
+    duplicated(knockdown[c("chromosome", "start", "end")])
+  )
+)  # we dont have duplicates
+
+
+# See which chromosomes occur in each sample
+table(control$chromosome)
+table(knockdown$chromosome)
+
+##Most chromosomes have fewer called intervals in knockdown, although chr7, chr19, chr20, chr21, and chrY have slightly more. Still, remember that these are peak counts only, not measurements of H3K9me3 abundance.
+
+```
+
+# Create genomic-range objects, how many intervals overlap between control and knockdown?
+
+```{r }
+
+library(GenomicRanges)
+
+# Preserve the supplied coordinates for this exploratory comparison.
+# Verify their convention before BED export or external annotation.
+control_gr <- GRanges(
+  seqnames = control$chromosome,
+  ranges = IRanges(start = control$start, end = control$end)
+)
+
+knockdown_gr <- GRanges(
+  seqnames = knockdown$chromosome,
+  ranges = IRanges(start = knockdown$start, end = knockdown$end)
+)
+
+# TRUE if an interval overlaps at least one interval in the other sample
+control_shared <- overlapsAny(control_gr, knockdown_gr)
+knockdown_shared <- overlapsAny(knockdown_gr, control_gr)
+
+overlap_summary = data.frame(
+  sample = c("Control", "HDAC7 knockdown"),
+  total_intervals = c(length(control_gr), length(knockdown_gr)),
+  overlapping_other_sample = c(
+    sum(control_shared),
+    sum(knockdown_shared)
+  ),
+  no_overlap_other_sample = c(
+    sum(!control_shared),
+    sum(!knockdown_shared)
+  ),
+  percent_overlapping = round(
+    100 * c(mean(control_shared), mean(knockdown_shared)),
+    1
+  )
+)
+
+overlap_summary
+
+# Most called H3K9me3 intervals occur at shared genomic locations. However, “overlap”  here means sharing at least one base. A knockdown interval could overlap a control interval while being shorter, longer, or shifted.
+# the 8,495 and 5,555 nonoverlapping intervals are sample-specific calls, rather than statistically established losses or gains yet
+
+```
+
+# Measure the fraction of each interval covered by the other sample’s intervals.
+To avoid double-counting when multiple intervals overlap.
+
+```{r }
+
+# Combine overlapping intervals within each sample.
+# min.gapwidth = 0 keeps merely adjacent intervals separate.
+control_union <- reduce(control_gr, min.gapwidth = 0L)
+knockdown_union <- reduce(knockdown_gr, min.gapwidth = 0L)
+
+# Fraction of each query interval covered by the other sample
+fraction_covered <- function(query, subject_union) {
+
+  hits <- findOverlaps(query, subject_union)
+  covered_bp <- numeric(length(query))
+
+  if (length(hits) > 0L) {
+
+    shared_pieces <- pintersect(
+      query[queryHits(hits)],
+      subject_union[subjectHits(hits)]
+    )
+
+    totals <- tapply(
+      width(shared_pieces),
+      queryHits(hits),
+      sum
+    )
+
+    covered_bp[as.integer(names(totals))] <- as.numeric(totals)
+  }
+
+  covered_bp / width(query)
+}
+
+control$overlap_fraction <- fraction_covered(
+  control_gr, knockdown_union
+)
+
+knockdown$overlap_fraction <- fraction_covered(
+  knockdown_gr, control_union
+)
+
+summary(control$overlap_fraction)
+summary(knockdown$overlap_fraction)
+
+
+# This shows that HDAC7 Knockdown intervals are more extensively covered by control intervals than the reverse. Mean overalp is 76.4% vs 62% (Consistent with knockdown experiments)
+```
+
+#  Measure total genomic coverage, counting every base only once
+
+```{r }
+
+# Genomic sequence covered by both samples
+shared_union <- intersect(control_union, knockdown_union)
+
+# Sequence covered by one sample's called regions only
+control_only <- setdiff(control_union, knockdown_union)
+knockdown_only <- setdiff(knockdown_union, control_union)
+
+coverage_summary <- data.frame(
+  category = c(
+    "Total control coverage",
+    "Total knockdown coverage",
+    "Shared coverage",
+    "Control-only coverage",
+    "Knockdown-only coverage"
+  ),
+  covered_Mb = c(
+    sum(as.numeric(width(control_union))),
+    sum(as.numeric(width(knockdown_union))),
+    sum(as.numeric(width(shared_union))),
+    sum(as.numeric(width(control_only))),
+    sum(as.numeric(width(knockdown_only)))
+  ) / 1e6
+)
+
+coverage_summary$covered_Mb <- round(
+  coverage_summary$covered_Mb, 2
+)
+
+coverage_summary
+
+# Breakingdown the coverage summary:
+# Control: 156.50 + 76.38 = 232.88 Mb,  156.5/232.88 = 67.2% of control coverage overlaps knockdown
+           
+
+# Knockdown: 156.50 + 36.01 = 192.51 Mb,  156.50/ 192.51 = 81.3 % of knockdown coverage overlaps control 
+
+#IMP observation: Knockdown intervals are generally shorter and cover less total genomic sequence
+
+#IMP observation: while 36.01 Mb of knockdown called regions falls outside control called regions. and 76.38 of the CTRL falls outside knockdown regions, Does this refer to gains or increased signal  at certain locations? A possibility to think about, does this mean biological contraction or redistribution of H3k9me3 bound regions
+
+
+```
+
+
+# check chromosome lengght acrross the three files are the same
+
+```{r }
+
+library(rtracklayer)
+library(GenomicRanges)
+
+
+bw_paths <- c(
+  Control = "data_raw/GSM8720290_gb2_sicontrol_h3k9me3.bw",
+  HDAC7_KD = "data_raw/GSM8720291_gb2_sihdac7_h3k9me3.bw",
+  Input = "data_raw/GSM8720292_gb2_input_h3k9me3.bw"
+)
+
+# Confirm all three files exist
+stopifnot(all(file.exists(bw_paths)))
+
+# Create references to the files
+bw_files <- lapply(bw_paths, BigWigFile)
+
+# Examine chromosomes and chromosome lengths
+seqinfo(bw_files$Control)
+seqinfo(bw_files$HDAC7_KD)
+seqinfo(bw_files$Input)
+
+# check that the chromsomes lenghts agree across samples 
+```
+
+
+# Reurning back to our genomic regions constructed from the bedfiles
+
+```{r }
+
+
+control_gr <- rtracklayer::import(
+  "data_raw/GSM8720290_gb2_sicontrol_h3k9me3.bed",
+  format = "BED"
+)
+
+knockdown_gr <- rtracklayer::import(
+  "data_raw/GSM8720291_gb2_sihdac7_h3k9me3.bed",
+  format = "BED"
+)
+
+# Retain genomic coordinates only
+mcols(control_gr) <- NULL
+mcols(knockdown_gr) <- NULL
+
+# Create common regions from both samples
+common_regions <- reduce(
+  c(control_gr, knockdown_gr),
+  min.gapwidth = 0L,
+  ignore.strand = TRUE
+)
+
+length(common_regions)
+head(common_regions)
+
+#common region are  regions formed by joining overlapping control and knockdown intervals. We will measure both samples across that same span so differences in interval boundaries do not affect the comparison area.
+
+```
+
+# Know lets measure peak boundries acrross all the common genomic reaions (46511)
+
+```{r }
+# 
+# Create a function to extract the mean signal
+extract_region_means <- function(bw, regions, batch_size = 100L) {
+
+  region_means <- rep(NA_real_, length(regions))
+
+  chromosome_indices <- split(
+    seq_along(regions),
+    as.character(seqnames(regions))
+  )
+
+  for (chr in names(chromosome_indices)) {
+
+    chr_idx <- chromosome_indices[[chr]]
+
+    # Request regions in genomic order
+    chr_idx <- chr_idx[
+      order(start(regions[chr_idx]), end(regions[chr_idx]))
+    ]
+
+    batches <- split(
+      chr_idx,
+      ceiling(seq_along(chr_idx) / batch_size)
+    )
+
+    for (i in seq_along(batches)) {
+
+      idx <- batches[[i]]
+
+      signal <- rtracklayer::import(
+        bw,
+        which = regions[idx],
+        as = "NumericList"
+      )
+
+      stopifnot(
+        length(signal) == length(idx),
+        all(
+          S4Vectors::elementNROWS(signal) ==
+            width(regions[idx])
+        )
+      )
+
+      # Store means at their original region indices
+      region_means[idx] <- vapply(
+        signal, mean, numeric(1)
+      )
+    }
+
+    message("Completed ", chr)
+  }
+
+  region_means
+}
+
+
+```
+
+
+#  Now Run this for both Knockdown and Ctrl
+
+## for ctrl
+```{r }
+control_means <- extract_region_means(
+  bw_files$Control,
+  common_regions
+)
+
+```
+
+## for KD
+```{r }
+
+knockdown_means <- extract_region_means(
+  bw_files$HDAC7_KD,
+  common_regions
+)
+```
+
+# Now build the complete signal table
+
+```{r }
+region_signal <- data.frame(
+  region_id = sprintf("region_%05d", seq_along(common_regions)),
+  chromosome = as.character(seqnames(common_regions)),
+  start = start(common_regions),
+  end = end(common_regions),
+  width_bp = width(common_regions),
+  control_mean = control_means,
+  knockdown_mean = knockdown_means
+)
+
+# Confirm the first six results match our test
+
+nrow(region_signal)
+head(region_signal)
+```
+
+# Check for missing, zero, or negative signal
+
+```{r }
+signal_checks <- data.frame(
+  sample = c("Control", "HDAC7 knockdown"),
+
+  nonfinite = c(
+    sum(!is.finite(control_means)),
+    sum(!is.finite(knockdown_means))
+  ),
+
+  zero = c(
+    sum(control_means == 0, na.rm = TRUE),
+    sum(knockdown_means == 0, na.rm = TRUE)
+  ),
+
+  negative = c(
+    sum(control_means < 0, na.rm = TRUE),
+    sum(knockdown_means < 0, na.rm = TRUE)
+  )
+)
+
+signal_checks
+
+summary(region_signal$control_mean)
+summary(region_signal$knockdown_mean)
+
+#Notice, Knockdown’s overall distribution is lower than control’s
+```
+
+# 13. Now calculate the fold change within each matching region:
+
+```{r }
+# Require complete, positive signal before calculating ratios
+stopifnot(
+  nrow(region_signal) == length(common_regions),
+  all(is.finite(region_signal$control_mean)),
+  all(is.finite(region_signal$knockdown_mean)),
+  all(region_signal$control_mean > 0),
+  all(region_signal$knockdown_mean > 0)
+)
+
+region_signal$fold_change <- with(
+  region_signal,
+  knockdown_mean / control_mean
+)
+
+region_signal$log2FC <- log2(region_signal$fold_change)
+
+summary(region_signal$log2FC)
+```
+
+# a 1.5-fold cutoff.
+```{r }
+# Select regions using a 1.5-fold linear change
+log2_cutoff <- log2(1.5)
+
+c(
+  increased_1.5fold =
+    sum(region_signal$log2FC >= log2_cutoff),
+
+  decreased_1.5fold =
+    sum(region_signal$log2FC <= -log2_cutoff),
+
+  between_thresholds =
+    sum(abs(region_signal$log2FC) < log2_cutoff)
+)
+
+# Store group labels for plots and downstream analysis
+region_signal$selection_1.5fold <- ifelse(
+  region_signal$log2FC >= log2_cutoff,
+  "Higher in knockdown",
+  ifelse(
+    region_signal$log2FC <= -log2_cutoff,
+    "Lower in knockdown",
+    "Between thresholds"
+  )
+)
+
+#Regions were selected using a descriptive threshold of ≥1.5-fold higher or lower normalized H3K9me3 signal in knockdown relative to control.
+```
+
+# Save the proceesed data till now
+```{r }
+dir.create("data_processed", showWarnings = FALSE)
+
+saveRDS(
+  region_signal,
+  "data_processed/common_region_signal.rds"
+)
+
+write.csv(
+  region_signal,
+  "data_processed/common_region_signal.csv",
+  row.names = FALSE
+)
+```
+
+# control vs knockdown signal scatterplot visualization
+```{r }
+
+library(ggplot2)
+
+region_signal$selection_1.5fold <- factor(
+  region_signal$selection_1.5fold,
+  levels = c(
+    "Between thresholds",
+    "Higher in knockdown",
+    "Lower in knockdown"
+  )
+)
+
+# Draw highlighted regions after the grey background
+plot_data <- region_signal[
+  order(region_signal$selection_1.5fold),
+]
+
+# Use identical limits on both axes
+axis_limits <- range(
+  log2(c(
+    region_signal$control_mean,
+    region_signal$knockdown_mean
+  ))
+)
+
+signal_plot <- ggplot(
+  plot_data,
+  aes(
+    x = log2(control_mean),
+    y = log2(knockdown_mean),
+    color = selection_1.5fold
+  )
+) +
+  geom_point(size = 0.6, alpha = 0.4) +
+
+  # Equal signal
+  geom_abline(
+    slope = 1, intercept = 0,
+    color = "black"
+  ) +
+
+  # 1.5-fold higher or lower signal
+  geom_abline(
+    slope = 1,
+    intercept = c(log2(1.5), -log2(1.5)),
+    linetype = "dashed",
+    color = "black"
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Between thresholds" = "grey75",
+      "Higher in knockdown" = "#D55E00",  #Orange ≥1.5-fold higher signal in knockdown: 399 regions
+      "Lower in knockdown" = "#0072B2"    #Blue ≥1.5-fold lower signal in knockdown: 2,484 regions
+    )
+  ) +
+
+  coord_fixed(
+    xlim = axis_limits,
+    ylim = axis_limits
+  ) +
+
+  labs(
+    title = "H3K9me3 signal in common genomic regions",
+    subtitle = "Public GB2 samples: descriptive 1.5-fold selection",
+    x = "log2 mean control signal",
+    y = "log2 mean HDAC7-knockdown signal",
+    color = NULL
+  ) +
+
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+signal_plot
+
+#The plot describes differences in the tracks. It does not establish statistical significance, total cellular H3K9me3 abundance, or domain spreading.
+```
+
+
+
+
+# Save the figure and selected regions
+```{r }
+dir.create("figures", showWarnings = FALSE)
+dir.create("data_processed", showWarnings = FALSE)
+
+ggsave(
+  "figures/H3K9me3_signal_scatter.png",
+  plot = signal_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+higher_regions <- subset(
+  region_signal,
+  selection_1.5fold == "Higher in knockdown"
+)
+
+lower_regions <- subset(
+  region_signal,
+  selection_1.5fold == "Lower in knockdown"
+)
+
+write.csv(
+  higher_regions,
+  "data_processed/H3K9me3_higher_1.5fold.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  lower_regions,
+  "data_processed/H3K9me3_lower_1.5fold.csv",
+  row.names = FALSE
+)
+```
+
+# Let’s build center-aligned signal matrices for the two groups. We’ll use these for the profiles and heatmaps.
+```{r }
+stopifnot(
+  nrow(region_signal) == length(common_regions),
+  all(region_signal$start == start(common_regions)),
+  all(region_signal$end == end(common_regions)),
+  all(
+    region_signal$chromosome ==
+      as.character(seqnames(common_regions))
+  )
+)
+
+higher_idx <- which(
+  region_signal$selection_1.5fold == "Higher in knockdown"
+)
+
+lower_idx <- which(
+  region_signal$selection_1.5fold == "Lower in knockdown"
+)
+
+c(higher = length(higher_idx), lower = length(lower_idx))
+#confirm that the region table and genomic ranges still match:
+```
+
+# Create the extraction function.
+```{r }
+make_center_matrix <- function(
+    bw, regions, flank = 5000L, bin_size = 100L) {
+
+  window_width <- 2L * flank
+  stopifnot(window_width %% bin_size == 0L)
+
+  centers <- start(regions) + (width(regions) - 1L) %/% 2L
+
+  window_starts <- centers - flank
+  window_ends <- centers + flank - 1L
+
+  # Check that every complete window fits within its chromosome
+  chr_lengths <- seqlengths(seqinfo(bw))[
+    as.character(seqnames(regions))
+  ]
+
+  if (anyNA(chr_lengths)) {
+    stop("Chromosome lengths are unavailable or names do not match.")
+  }
+
+  if (any(window_starts < 1L | window_ends > chr_lengths)) {
+    stop("Some windows cross chromosome boundaries.")
+  }
+
+  windows <- GRanges(
+    seqnames = seqnames(regions),
+    ranges = IRanges(
+      start = window_starts,
+      end = window_ends
+    )
+  )
+
+  result <- matrix(
+    NA_real_,
+    nrow = length(regions),
+    ncol = window_width / bin_size
+  )
+
+  for (i in seq_along(windows)) {
+
+    signal <- rtracklayer::import(
+      bw,
+      which = windows[i],
+      as = "NumericList"
+    )
+
+    stopifnot(
+      length(signal) == 1L,
+      length(signal[[1]]) == window_width
+    )
+
+    # Each column contains 100 consecutive genomic bases
+    bins <- matrix(
+      as.numeric(signal[[1]]),
+      nrow = bin_size
+    )
+
+    result[i, ] <- colMeans(bins)
+
+    if (i %% 100L == 0L || i == length(windows)) {
+      message("Completed ", i, " of ", length(windows), " regions")
+    }
+  }
+
+  result
+}
+```
+
+# create all four matrices:
+```{r }
+higher_control_matrix <- make_center_matrix(
+  bw_files$Control, common_regions[higher_idx]
+)
+
+higher_knockdown_matrix <- make_center_matrix(
+  bw_files$HDAC7_KD, common_regions[higher_idx]
+)
+
+lower_control_matrix <- make_center_matrix(
+  bw_files$Control, common_regions[lower_idx]
+)
+
+lower_knockdown_matrix <- make_center_matrix(
+  bw_files$HDAC7_KD, common_regions[lower_idx]
+)
+```
+
+# Save the matrices together with their region identifiers:
+```{r }
+saveRDS(
+  list(
+    higher_region_ids = region_signal$region_id[higher_idx],
+    lower_region_ids = region_signal$region_id[lower_idx],
+    higher_control = higher_control_matrix,
+    higher_knockdown = higher_knockdown_matrix,
+    lower_control = lower_control_matrix,
+    lower_knockdown = lower_knockdown_matrix,
+    flank_bp = 5000L,
+    bin_size_bp = 100L
+  ),
+  "data_processed/H3K9me3_center_matrices.rds"
+)
+```
+
+# Check them
+```{r }
+lapply(
+  list(
+    higher_control = higher_control_matrix,
+    higher_knockdown = higher_knockdown_matrix,
+    lower_control = lower_control_matrix,
+    lower_knockdown = lower_knockdown_matrix
+  ),
+  dim
+)
+```
+
+# Visulaize
+```{r }
+library(ggplot2)
+
+# Bin midpoints in kb, matching the extraction windows
+positions_kb <- seq(
+  from = -4950.5,
+  by = 100,
+  length.out = 100
+) / 1000
+
+profile_data <- rbind(
+  data.frame(
+    position_kb = positions_kb,
+    signal = colMeans(higher_control_matrix),
+    sample = "Control",
+    group = "Higher in knockdown (399 regions)"
+  ),
+  data.frame(
+    position_kb = positions_kb,
+    signal = colMeans(higher_knockdown_matrix),
+    sample = "HDAC7 knockdown",
+    group = "Higher in knockdown (399 regions)"
+  ),
+  data.frame(
+    position_kb = positions_kb,
+    signal = colMeans(lower_control_matrix),
+    sample = "Control",
+    group = "Lower in knockdown (2,484 regions)"
+  ),
+  data.frame(
+    position_kb = positions_kb,
+    signal = colMeans(lower_knockdown_matrix),
+    sample = "HDAC7 knockdown",
+    group = "Lower in knockdown (2,484 regions)"
+  )
+)
+
+profile_plot <- ggplot(
+  profile_data,
+  aes(x = position_kb, y = signal, color = sample)
+) +
+  geom_line(size = 1) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dotted",
+    color = "grey40"
+  ) +
+  facet_wrap(~ group, nrow = 1) +
+  scale_color_manual(
+    values = c(
+      "Control" = "#0072B2",
+      "HDAC7 knockdown" = "#D55E00"
+    )
+  ) +
+  coord_cartesian(xlim = c(-1, 1)) +
+  scale_x_continuous(
+    breaks = c(-1, 0, 1),
+    labels = c("-1 kb", "Center", "+1 kb")
+  ) +
+  labs(
+    title = "H3K9me3 signal around common-region centers",
+    subtitle = "Descriptive 1.5-fold selection; 100-bp bins",
+    x = "Distance from region center (kb)",
+    y = "Mean BigWig signal",
+    color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(profile_plot)
+
+
+
+
+#the main observation is a stronger signal near the center in the higher in KD (399regions). This plot supports describing higher local H3K9me3 signal at those regions. It does not, by itself, demonstrate heterochromatin spreading.
+
+
+#Therfore, HDAC7 kd here shows increased mean H3K9me3 signal at 399 selected common regions and decreased signal at 2,484 selected regions. Within ±1 kb of region centers, the profiles primarily show changes in signal intensity, without clear evidence of domain broadening.
+```
+
+
+
+# save the plot
+```{r }
+dir.create("figures", showWarnings = FALSE)
+
+ggsave(
+  "figures/H3K9me3_center_profiles.png",
+  plot = profile_plot,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+```
+
+# Let’s create four heatmaps, with control and knockdown side by side for each group.
+```{r }
+# Bins covering approximately ±1 kb around the center
+central_bins <- 41:60
+
+higher_order <- order(
+  rowMeans(
+    (higher_control_matrix[, central_bins] +
+       higher_knockdown_matrix[, central_bins]) / 2
+  ),
+  decreasing = TRUE
+)
+
+lower_order <- order(
+  rowMeans(
+    (lower_control_matrix[, central_bins] +
+       lower_knockdown_matrix[, central_bins]) / 2
+  ),
+  decreasing = TRUE
+)
+
+
+```
+
+# Prepare the matrices for plotting
+```{r }
+
+matrix_to_table <- function(mat, row_order, group, sample) {
+
+  mat <- mat[row_order, , drop = FALSE]
+
+  data.frame(
+    position_kb = rep(positions_kb, each = nrow(mat)),
+    region_rank = rep(seq_len(nrow(mat)), times = ncol(mat)),
+    signal = as.vector(mat),
+    group = group,
+    sample = sample
+  )
+}
+
+heatmap_data <- rbind(
+  matrix_to_table(
+    higher_control_matrix, higher_order,
+    "Higher in knockdown (399 regions)", "Control"
+  ),
+  matrix_to_table(
+    higher_knockdown_matrix, higher_order,
+    "Higher in knockdown (399 regions)", "HDAC7 knockdown"
+  ),
+  matrix_to_table(
+    lower_control_matrix, lower_order,
+    "Lower in knockdown (2,484 regions)", "Control"
+  ),
+  matrix_to_table(
+    lower_knockdown_matrix, lower_order,
+    "Lower in knockdown (2,484 regions)", "HDAC7 knockdown"
+  )
+)
+
+heatmap_data$sample <- factor(
+  heatmap_data$sample,
+  levels = c("Control", "HDAC7 knockdown")
+)
+
+heatmap_data$group <- factor(
+  heatmap_data$group,
+  levels = c(
+    "Higher in knockdown (399 regions)",
+    "Lower in knockdown (2,484 regions)"
+  )
+)
+
+```
+
+# Draw the heatmaps
+```{r }
+
+color_cap <- as.numeric(
+  quantile(heatmap_data$signal, 0.99)
+)
+
+heatmap_data$display_signal <- pmin(
+  heatmap_data$signal,
+  color_cap
+)
+
+heatmap_plot <- ggplot(
+  heatmap_data,
+  aes(
+    x = position_kb,
+    y = region_rank,
+    fill = display_signal
+  )
+) +
+  geom_raster() +
+  facet_grid(group ~ sample, scales = "free_y") +
+  scale_y_reverse(expand = c(0, 0)) +
+  scale_x_continuous(
+    breaks = c(-5, 0, 5),
+    labels = c("-5", "Center", "+5"),
+    expand = c(0, 0)
+  ) +
+  scale_fill_gradientn(
+    colors = c("white", "#FFF7BC", "#FEC44F", "#D95F0E", "#7F0000"),
+    limits = c(0, color_cap),
+    name = "Mean signal"
+  ) +
+  labs(
+    title = "H3K9me3 signal around region centers",
+    subtitle = paste0(
+      "Descriptive 1.5-fold groups; shared color scale capped at ",
+      round(color_cap, 3)
+    ),
+    x = "Distance from region center (kb)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+heatmap_plot
+
+
+
+```
+# save
+```{r }
+ggsave(
+  "figures/H3K9me3_center_heatmaps.png",
+  plot = heatmap_plot,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+
+```
+
+
+
+# H3K9me3 signal profiles and Heatmaps together
+```{r }
+library(ggplot2)
+library(grid)
+
+# Positions for the existing 100-bin matrices.
+# Keep these consistent with your original extraction coordinates.
+positions_kb <- seq(
+  from = -4950.5,
+  by = 100,
+  length.out = 100
+) / 1000
+
+matrices <- list(
+  higher_control_matrix,
+  higher_knockdown_matrix,
+  lower_control_matrix,
+  lower_knockdown_matrix
+)
+
+stopifnot(
+  all(vapply(matrices, ncol, integer(1)) == length(positions_kb)),
+  nrow(higher_control_matrix) == nrow(higher_knockdown_matrix),
+  nrow(lower_control_matrix) == nrow(lower_knockdown_matrix)
+)
+
+# Use the same row order for both conditions within each group.
+# Sort by control signal near the center.
+central_bins <- abs(positions_kb) <= 1
+
+higher_order <- order(
+  rowMeans(higher_control_matrix[, central_bins, drop = FALSE]),
+  decreasing = TRUE
+)
+
+lower_order <- order(
+  rowMeans(lower_control_matrix[, central_bins, drop = FALSE]),
+  decreasing = TRUE
+)
+
+# Profile plot
+make_profile <- function(control, knockdown, title) {
+
+  dat <- rbind(
+    data.frame(
+      position_kb = positions_kb,
+      signal = colMeans(control),
+      sample = "siControl"
+    ),
+    data.frame(
+      position_kb = positions_kb,
+      signal = colMeans(knockdown),
+      sample = "siHDAC7"
+    )
+  )
+
+  ggplot(dat, aes(position_kb, signal, color = sample)) +
+    geom_line(size = 0.7) +
+    scale_color_manual(
+      values = c(
+        "siControl" = "#756BB1",
+        "siHDAC7" = "#A6D96A"
+      )
+    ) +
+    scale_x_continuous(
+      breaks = c(-1, 0, 1),
+      labels = c("-1 kb", "Center", "+1 kb"),
+      expand = c(0, 0)
+    ) +
+    coord_cartesian(xlim = c(-1, 1)) +
+    labs(
+      title = title,
+      x = NULL,
+      y = "Mean signal",
+      color = NULL
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 11),
+      legend.position = "top",
+      legend.text = element_text(size = 8),
+      legend.key.width = unit(0.6, "cm"),
+      plot.margin = margin(5, 12, 5, 5)
+    )
+}
+
+# Heatmap: each row is one genomic region.
+make_heatmap <- function(mat, row_order, condition,
+                         show_x = FALSE, show_legend = FALSE) {
+
+  mat <- mat[row_order, , drop = FALSE]
+
+  dat <- data.frame(
+    position_kb = rep(positions_kb, each = nrow(mat)),
+    region = rep(nrow(mat):1, times = ncol(mat)),
+    signal = as.vector(mat)
+  )
+
+  p <- ggplot(dat, aes(position_kb, region, fill = signal)) +
+    geom_raster() +
+    scale_fill_gradientn(
+      colors = c(
+        "#A50026",   # Low: red
+        "#F46D43",
+        "#FEE090",
+        "#E0F3F8",
+        "#4575B4",
+        "#313695"    # High: blue
+      ),
+      limits = c(0, 0.45),
+      oob = scales::squish,
+      name = "Signal"
+    ) +
+    scale_x_continuous(
+      breaks = c(-1, 0, 1),
+      labels = c("-1 kb", "Center", "+1 kb"),
+      expand = c(0, 0)
+    ) +
+    scale_y_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(-1, 1)) +
+    labs(x = NULL, y = condition) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.title.y = element_text(size = 10),
+      legend.position = if (show_legend) "right" else "none",
+      legend.key.height = unit(0.7, "cm"),
+      plot.margin = margin(0, 12, 0, 5)
+    )
+
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+
+  p
+}
+
+# Create compact profile plots
+profile_style <- theme(
+  plot.title = element_text(size = 10, hjust = 0.5),
+  axis.title.y = element_text(size = 9),
+  axis.text = element_text(size = 8),
+  legend.position = "top",
+  legend.text = element_text(size = 8),
+  legend.key.height = unit(0.3, "cm"),
+  legend.key.width = unit(0.5, "cm"),
+  legend.margin = margin(0, 0, 0, 0),
+  legend.box.spacing = unit(0, "cm"),
+  plot.margin = margin(5, 5, 5, 5)
+)
+
+p_increased <- make_profile(
+  higher_control_matrix,
+  higher_knockdown_matrix,
+  "Increased H3K9me3\n399 regions"
+) + profile_style
+
+p_decreased <- make_profile(
+  lower_control_matrix,
+  lower_knockdown_matrix,
+  "Decreased H3K9me3\n2,484 regions"
+) + profile_style
+
+# Compact heatmap labels
+heatmap_style <- theme(
+  axis.title.y = element_text(size = 9),
+  axis.text.x = element_text(size = 8),
+  axis.ticks.length = unit(0.08, "cm"),
+  plot.margin = margin(2, 5, 2, 5)
+)
+
+h_inc_control <- make_heatmap(
+  higher_control_matrix, higher_order, "siControl"
+) + heatmap_style
+
+h_inc_knockdown <- make_heatmap(
+  higher_knockdown_matrix, higher_order, "siHDAC7",
+  show_x = TRUE
+) + heatmap_style
+
+h_dec_control <- make_heatmap(
+  lower_control_matrix, lower_order, "siControl"
+) + heatmap_style
+
+h_dec_knockdown <- make_heatmap(
+  lower_knockdown_matrix, lower_order, "siHDAC7",
+  show_x = TRUE
+) + heatmap_style
+
+# Extract one shared color legend
+legend_source <- make_heatmap(
+  lower_knockdown_matrix, lower_order, "siHDAC7",
+  show_legend = TRUE
+) +
+  theme(
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.key.width = unit(0.3, "cm"),
+    legend.key.height = unit(0.7, "cm")
+  )
+
+legend_gtable <- ggplotGrob(legend_source)
+
+legend_index <- which(vapply(
+  legend_gtable$grobs,
+  function(g) g$name == "guide-box",
+  logical(1)
+))
+
+shared_legend <- legend_gtable$grobs[[legend_index[1]]]
+
+# Convert panels to grobs and align their plotting areas
+panel_grobs <- lapply(
+  list(
+    p_increased, p_decreased,
+    h_inc_control, h_dec_control,
+    h_inc_knockdown, h_dec_knockdown
+  ),
+  ggplotGrob
+)
+
+common_widths <- do.call(
+  unit.pmax,
+  lapply(panel_grobs, function(g) g$widths)
+)
+
+panel_grobs <- lapply(panel_grobs, function(g) {
+  g$widths <- common_widths
+  g
+})
+
+# Draw grobs directly, with sufficient space for the profiles
+draw_figure <- function() {
+
+  grid.newpage()
+
+  pushViewport(viewport(
+    width = 0.97,
+    height = 0.97,
+    layout = grid.layout(
+      nrow = 3,
+      ncol = 4,
+      heights = unit(c(0.32, 0.34, 0.34), "null"),
+      widths = unit(c(1, 0.045, 1, 0.18), "null")
+    )
+  ))
+
+  draw_panel <- function(grob, row, column) {
+    pushViewport(viewport(
+      layout.pos.row = row,
+      layout.pos.col = column
+    ))
+    grid.draw(grob)
+    popViewport()
+  }
+
+  draw_panel(panel_grobs[[1]], 1, 1)
+  draw_panel(panel_grobs[[2]], 1, 3)
+
+  draw_panel(panel_grobs[[3]], 2, 1)
+  draw_panel(panel_grobs[[4]], 2, 3)
+
+  draw_panel(panel_grobs[[5]], 3, 1)
+  draw_panel(panel_grobs[[6]], 3, 3)
+
+  draw_panel(shared_legend, 2:3, 4)
+
+  popViewport()
+}
+
+draw_figure()
+
+
+
+# Visualize H3K9me3 signal around common-region centers.
+# Regions are grouped using a descriptive 1.5-fold cutoff:
+# 399 regions with higher signal and 2,484 with lower signal following HDAC7 knockdown.
+
+# Each column contains average signal profiles above paired siControl and siHDAC7 heatmaps, displayed within ±1 kb.
+# Regions are sorted by central siControl signal, with the same row order retained across conditions within each group.
+# Heatmaps share a color scale capped at 0.45.
+# These plots summarize signal intensity and variation across kd vs CT. Fold-change selection alone does not establish statistical significance, and these plots do not independently demonstrate heterochromatin spreading.
+
+```
+
+# Save with high reslolution
+```{r }
+
+# Save high-resolution PNG
+png(( "figures/ H3K9me3_Signal_Profiles_and_Heatmaps.png"
+  ),
+  width = 8,
+  height = 9,
+  units = "in",
+  res = 300,
+  bg = "white"
+)
+
+draw_figure()
+dev.off()
+
+# Save PDF
+pdf( ("figures/ H3K9me3_Signal_Profiles_and_Heatmaps.pdf"
+  ),
+  width = 8,
+  height = 9,
+  bg = "white"
+)
+
+draw_figure()
+dev.off()
+
+
+
+
+```
+
+
+```{r }
+higher_input_matrix <- make_center_matrix(
+  bw_files$Input,
+  common_regions[higher_idx]
+)
+
+lower_input_matrix <- make_center_matrix(
+  bw_files$Input,
+  common_regions[lower_idx]
+)
+
+dim(higher_input_matrix)  # Expected: 399 × 100
+dim(lower_input_matrix)   # Expected: 2484 × 100
+
+```
+
+#  H3K9me3 signal profiles for the KD vs CT vs input
+```{r }
+profile_with_input <- rbind(
+  profile_data,
+  data.frame(
+    position_kb = positions_kb,
+    signal = colMeans(higher_input_matrix),
+    sample = "Input",
+    group = "Higher in knockdown (399 regions)"
+  ),
+  data.frame(
+    position_kb = positions_kb,
+    signal = colMeans(lower_input_matrix),
+    sample = "Input",
+    group = "Lower in knockdown (2,484 regions)"
+  )
+)
+
+input_profile_plot <- ggplot(
+  profile_with_input,
+  aes(position_kb, signal, color = sample, linetype = sample)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dotted",
+    color = "grey50"
+  ) +
+  facet_wrap(~ group, nrow = 1) +
+  scale_x_continuous(
+    breaks = c(-1, -0.5, 0, 0.5, 1)
+  ) +
+  coord_cartesian(
+    xlim = c(-1, 1),
+    expand = FALSE
+  )+
+  scale_color_manual(
+    values = c(
+      "Control" = "#0072B2",
+      "HDAC7 knockdown" = "#D55E00",
+      "Input" = "grey35"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Control" = "solid",
+      "HDAC7 knockdown" = "solid",
+      "Input" = "dashed"
+    )
+  ) +
+  labs(
+    title = "H3K9me3 profiles with input background",
+    x = "Distance from region center (kb)",
+    y = "Mean BigWig signal",
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+input_profile_plot
+
+#the input has no central peak in either group (the dashed grey curve remains relatively flat,)
+
+```
+
+# Gene anotation
+### We’ll annotate all 46,511 common regions first, 
+### We’ll use ChIPseeker with hg38, we’ll define a promoter as −3 kb to +1 kb around the transcription start site (TSS).
+
+```{r }
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+
+#Check that the regions match your signal table to prevent assigning a gene to the wrong signal row.
+
+stopifnot(
+  length(common_regions) == nrow(region_signal),
+  !anyDuplicated(region_signal$region_id),
+  all(as.character(seqnames(common_regions)) ==
+        as.character(region_signal$chromosome)),
+  all(start(common_regions) == region_signal$start),
+  all(end(common_regions) == region_signal$end)
+)
+
+# Work on a copy and attach the existing region identifiers
+regions_to_annotate <- common_regions
+
+mcols(regions_to_annotate)$region_id <-
+  as.character(region_signal$region_id)
+
+```
+
+
+
+### Annotate common regions
+```{r }
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+common_annotation <- annotatePeak(
+  regions_to_annotate,
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db",
+  tssRegion = c(-3000, 1000),
+  level = "transcript",
+  verbose = TRUE
+)
+
+annotation_table <- as.data.frame(common_annotation)
+
+head(
+  annotation_table[
+    ,
+    c(
+      "region_id",
+      "seqnames",
+      "start",
+      "end",
+      "annotation",
+      "geneId",
+      "SYMBOL",
+      "distanceToTSS"
+    )
+  ]
+)
+
+```
+
+### Match by region identifier rather than assuming annotation preserves row order.
+```{r }
+
+signal_row <- match(
+  annotation_table$region_id,
+  region_signal$region_id
+)
+
+stopifnot(
+  nrow(annotation_table) == nrow(region_signal),
+  !anyDuplicated(annotation_table$region_id),
+  !anyNA(signal_row)
+)
+
+annotated_regions <- annotation_table
+
+signal_columns <- c(
+  "control_mean",
+  "knockdown_mean",
+  "fold_change",
+  "log2FC",
+  "selection_1.5fold"
+)
+
+annotated_regions[signal_columns] <-
+  region_signal[signal_row, signal_columns, drop = FALSE]
+
+```
+
+```{r }
+annotated_regions$feature <- sub(
+  "\\s*\\(.*$",
+  "",
+  annotated_regions$annotation
+)
+
+feature_counts <- with(
+  annotated_regions,
+  table(
+    group = selection_1.5fold,
+    feature = feature
+  )
+)
+
+feature_percentages <- round(
+  100 * prop.table(feature_counts, margin = 1),
+  1
+)
+
+feature_counts
+feature_percentages
+
+#difference were predominantly assigned to intronic and distal intergenic locations.
+```
+
+
+# Genome browser tracks for the three regions with the largest increases in H3K9me3 signal.
+```{r }
+higher_regions <- subset(
+  annotated_regions,
+  selection_1.5fold == "Higher in knockdown"
+)
+
+higher_regions <- higher_regions[
+  order(
+    -higher_regions$fold_change,
+    as.character(higher_regions$seqnames),
+    higher_regions$start
+  ),
+]
+
+top_loci <- head(higher_regions, 3)
+
+top_loci[
+  ,
+  c(
+    "region_id",
+    "seqnames",
+    "start",
+    "end",
+    "SYMBOL",
+    "annotation",
+    "fold_change"
+  )
+]
+```
+
+#
+```{r }
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+
+plot_locus_tracks <- function(locus, flank_bp = 5000L) {
+
+  chromosome <- as.character(locus$seqnames[1])
+  region_start <- as.integer(locus$start[1])
+  region_end <- as.integer(locus$end[1])
+
+  chromosome_lengths <- vapply(
+    bw_files[c("Control", "HDAC7_KD", "Input")],
+    function(bw) {
+      as.numeric(seqlengths(seqinfo(bw))[chromosome])
+    },
+    numeric(1)
+  )
+
+  stopifnot(all(is.finite(chromosome_lengths)))
+
+  window_start <- max(1L, region_start - flank_bp)
+  window_end <- min(
+    min(chromosome_lengths),
+    region_end + flank_bp
+  )
+
+  window <- GRanges(
+    seqnames = chromosome,
+    ranges = IRanges(window_start, window_end)
+  )
+
+  sample_labels <- c(
+    Control = "Control",
+    HDAC7_KD = "HDAC7 knockdown",
+    Input = "Input"
+  )
+
+  track_data <- do.call(
+    rbind,
+    lapply(names(sample_labels), function(sample_name) {
+
+      signal <- rtracklayer::import(
+        bw_files[[sample_name]],
+        which = window,
+        as = "NumericList"
+      )
+
+      stopifnot(
+        length(signal) == 1L,
+        length(signal[[1]]) == width(window)
+      )
+
+      data.frame(
+        position_Mb = seq.int(
+          window_start,
+          window_end
+        ) / 1e6,
+        signal = as.numeric(signal[[1]]),
+        sample = unname(sample_labels[sample_name])
+      )
+    })
+  )
+
+  track_data$sample <- factor(
+    track_data$sample,
+    levels = c("Control", "HDAC7 knockdown", "Input")
+  )
+
+  ggplot(
+    track_data,
+    aes(position_Mb, signal, color = sample)
+  ) +
+    geom_line(size = 0.4) +
+    geom_vline(
+      xintercept = c(region_start, region_end) / 1e6,
+      linetype = "dotted",
+      color = "grey50"
+    ) +
+    facet_grid(sample ~ .) +
+    scale_color_manual(
+      values = c(
+        "Control" = "#0072B2",
+        "HDAC7 knockdown" = "#D55E00",
+        "Input" = "grey35"
+      )
+    ) +
+    coord_cartesian(
+      xlim = c(window_start, window_end) / 1e6
+    ) +
+    labs(
+      title = paste("H3K9me3 tracks:", locus$region_id[1]),
+      subtitle = paste0(
+        chromosome, ":", region_start, "-", region_end,
+        " | KD/control fold change = ",
+        round(locus$fold_change[1], 2)
+      ),
+      x = paste0(chromosome, " position (Mb; hg38)"),
+      y = "BigWig signal"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "white")
+    )
+}
+```
+
+### Display the genome browswer track
+```{r }
+locus_plot <- plot_locus_tracks(
+  top_loci[1, , drop = FALSE]
+)
+
+locus_plot
+```
+### Save
+```{r }
+dir.create("figures", showWarnings = FALSE)
+
+for (i in seq_len(nrow(top_loci))) {
+
+  p <- plot_locus_tracks(
+    top_loci[i, , drop = FALSE]
+  )
+
+  ggsave(
+    filename = file.path(
+      "figures",
+      paste0(
+        "H3K9me3_tracks_",
+        top_loci$region_id[i],
+        ".png"
+      )
+    ),
+    plot = p,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+}
+```
+
+### tracks for the other two highest
+```{r }
+plot_locus_tracks(
+  top_loci[top_loci$region_id == "region_44154", , drop = FALSE]
+)
+
+plot_locus_tracks(
+  top_loci[top_loci$region_id == "region_45783", , drop = FALSE]
+)
+
+```
+
+
+```{r }
+annotated_regions[
+  annotated_regions$region_id == "region_18665",
+  c(
+    "region_id",
+    "seqnames",
+    "start",
+    "end",
+    "annotation",
+    "SYMBOL",
+    "geneId",
+    "distanceToTSS",
+    "control_mean",
+    "knockdown_mean",
+    "fold_change"
+  )
+]
+
+#SMIM29 is increased by 3 fold in KD compared to CT
+```
+
+```{r }
+annotated_regions[
+  annotated_regions$region_id == "region_44154",
+  c(
+    "region_id",
+    "seqnames",
+    "start",
+    "end",
+    "annotation",
+    "SYMBOL",
+    "geneId",
+    "distanceToTSS",
+    "control_mean",
+    "knockdown_mean",
+    "fold_change"
+  )
+]
+
+#LINC00158 is increased by 3 fold in KD compared to CT
+```
+
+```{r }
+annotated_regions[
+  annotated_regions$region_id == "region_45783",
+  c(
+    "region_id",
+    "seqnames",
+    "start",
+    "end",
+    "annotation",
+    "SYMBOL",
+    "geneId",
+    "distanceToTSS",
+    "control_mean",
+    "knockdown_mean",
+    "fold_change"
+  )
+]
+
+#MSN is increased by 2.8 fold in KD compared to CT
+```
+
+### Interpretaion to follow up, HDAC7 knockdown increases H3K9me3 at an MSN-associated region, potentially contributing to reduced MSN expression and less aggressive cellular behavior.
+
+
+```{r }
+
+
+top_loci[
+  ,
+  c(
+    "region_id",
+    "seqnames",
+    "start",
+    "end",
+    "SYMBOL",
+    "annotation",
+    "distanceToTSS",
+    "fold_change"
+  )
+]
+
+
+```
+
+```{r }
+plot_locus_tracks(
+  top_loci[top_loci$region_id == "region_44154", , drop = FALSE]
+)
+
+plot_locus_tracks(
+  top_loci[top_loci$region_id == "region_45783", , drop = FALSE]
+)
+
+```
+
+```{r }
+
+```
+
+## Data scope and analysis design: 
+**This notebook explores the publicly available H3K9me3 ChIP-seq tracks associated with the published study, using control, HDAC7 knockdown, and input data. It focuses on genomic coverage, signal visualization, and annotation of regions selected using an exploratory 1.5-fold change threshold. The analysis complements the publication by providing a reproducible workflow for examining the deposited tracks. Results are presented descriptively, with replicate-based statistical testing outside the scope of this notebook.**
