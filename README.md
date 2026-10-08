@@ -31,7 +31,21 @@ H3K9me3 CHIPseq was performed on patient-derived GSCs following HDAC7 siRNA knoc
 - Perturbation: HDAC7 knockdown using siRNA
 - Comparison: siHDAC7 vs. sicontrol
 - Epigebetic mark: H3K9me3
-- Assay: Bulk RNA-seq
+- Assay: CHIP-Seq
 - Objective: Characterize HDAC7-dependent changes in repressive chromatin
-- Approach: Peak calling using SICER 1.1 for mapping enrichment H3K9me3 regions relative to input and CTRL 
+- Approach: Peak calling using SICER 1.1 for mapping enrichment H3K9me3 regions relative to input and CTRL
+
+# Full Analysis
+
+**[View the complete rendered CHIP-seq analysis →](https://olahassan000.github.io/HDAC7-GBM-Epigenomics/)**
+
+The full R Markdown workflow includes H3K9me3 enrichment analysis in HDAC7-knockdown versus control GSCs, identification and comparison of regions with differential H3K9me3 signal, genome-wide signal profiling and heatmap visualization, genomic annotation of enriched regions, and biological interpretation of HDAC7-associated heterochromatin remodeling.
+
+# Confidentiality
+
+This work is part of the published study (https://www.jbc.org/article/S0021-9258(25)02584-0/fulltext), the data used here are publicly available.
+
+# Conflict of interest
+
+There is a patent application (PCT/US2022/077910) for HDAC7-specific inhibitors. Homer Therapeutics, Inc, is working to develop cancer therapeutics, specifically targeting HDAC7.
 
